@@ -7,8 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/aws-sdk-go/service/ssm"
 )
 
 // AWSClient encapsulates serveral helper method to retrive data from AWS cloud
@@ -135,6 +138,7 @@ func (a *AWSClient) GetECSTaskDef(cluster, service string) (string, error) {
 // GetENVsFromECSTaskDef returns enviroment variable in a task definition
 func (a *AWSClient) GetENVsFromECSTaskDef(taskDef string) (map[string]string, error) {
 	svc := ecs.New(a.sn)
+	ssmSvc := ssm.New(a.sn)
 
 	input := &ecs.DescribeTaskDefinitionInput{
 		TaskDefinition: &taskDef,
@@ -162,6 +166,28 @@ func (a *AWSClient) GetENVsFromECSTaskDef(taskDef string) (map[string]string, er
 
 	for _, kvPair := range containerDef.Environment {
 		envs[*kvPair.Name] = *kvPair.Value
+	}
+
+	for _, kvPair := range containerDef.Secrets {
+		// Secrets ValueFrom is an arn pointing to SSM or Secrets Manager
+		secret_arn, err := arn.Parse(*kvPair.ValueFrom)
+		if err != nil {
+			return nil, errors.New("failed to parse secret arn")
+		}
+		if secret_arn.Service == "ssm" {
+			// SSM ARNs include a prefix 'parameter' which must be stripped before calling GetParameter
+			param_name := strings.TrimPrefix(*aws.String(secret_arn.Resource), "parameter")
+			result, err := ssmSvc.GetParameter(&ssm.GetParameterInput{
+				Name:           &param_name,
+				WithDecryption: aws.Bool(true),
+			})
+			if err != nil {
+				return nil, errors.New("failed to get secret from ssm path:" + secret_arn.Resource)
+			}
+			envs[*kvPair.Name] = *result.Parameter.Value
+		} else {
+			return nil, errors.New("unsupported secret manager: " + secret_arn.Service)
+		}
 	}
 
 	return envs, nil
